@@ -8,4 +8,4 @@ futures = "0.3"
 moka = { version = "0.12", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"]}
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"]}

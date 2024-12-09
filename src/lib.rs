@@ -6,12 +6,12 @@ use log::{write_key_value, write_key_raw_value, Log, LogEntry, LogReader, LogSta
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-
+use tokio::sync::Mutex as AsyncMutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, RwLock};
 
 pub type Result<T> = std::result::Result<T, crate::error::TinyDbError>;
 
@@ -83,7 +83,7 @@ pub struct Store<K> {
 
 struct StoreState<K> {
     index: Arc<RwLock<HashMap<K, IndexEntry>>>,
-    log_state: Arc<Mutex<LogState>>,
+    log_state: Arc<AsyncMutex<LogState>>,
     root: PathBuf,
     options: Options,
     compaction_in_progress: Arc<AtomicBool>,
@@ -148,7 +148,7 @@ impl<K> Store<K>
         Ok(Self {
             state: Arc::new(StoreState {
                 index: Arc::new(RwLock::new(index)),
-                log_state: Arc::new(Mutex::new(LogState {
+                log_state: Arc::new(AsyncMutex::new(LogState {
                     active_log: Log {
                         file,
                         len,
@@ -206,7 +206,7 @@ impl<K> Store<K>
 
         // write to log with latest version
         let compaction_required = {
-            let mut log_state = self.state.log_state.lock().expect("active log lock");
+            let mut log_state = self.state.log_state.lock().await;
             let version = log_state.next_version();
             write_u64(buf, EntryMetadata::new(version, deleting).0);
             let old_offset = log_state.active_log.append(&buf).await?;
@@ -238,7 +238,7 @@ impl<K> Store<K>
             // check if new log must be created
             if log_state.active_log.len >= self.state.options.log_file_size {
                 // TODO: Slow function. Need to fix it
-                self.create_new_active_log_file(&mut log_state).await?;
+                Self::create_new_active_log_file(self.state.root.clone(), &mut log_state).await?;
             }
 
             // maybe start background compaction
@@ -253,13 +253,9 @@ impl<K> Store<K>
     }
 
     pub async fn force_compaction(&self) -> Result<()> {
-        {
-            let mut log_state = self.state.log_state.lock().unwrap();
-            self.create_new_active_log_file(&mut log_state).await?;
-        }
         Self::compact(self.state.clone()).await?;
         {
-            let log_state = self.state.log_state.lock().unwrap();
+            let log_state = self.state.log_state.lock().await;
             let live_fraction = log_state.live_entries_num as f64 / log_state.entries_num as f64;
             println!("live fraction = {live_fraction}, live = {}, log_state.total = {}", log_state.live_entries_num, log_state.entries_num);
         }
@@ -276,9 +272,9 @@ impl<K> Store<K>
         log::read(&mut file, index_entry.offset, index_entry.len, buf).await
     }
 
-    async fn create_new_active_log_file(&self, log_state: &mut LogState) -> Result<()> {
+    async fn create_new_active_log_file(root: PathBuf, log_state: &mut LogState) -> Result<()> {
         let file_id = log_state.next_file_id();
-        let log_file_name = self.state.root.join(log_file_name(file_id));
+        let log_file_name = root.join(log_file_name(file_id));
 
         let file = tokio::fs::OpenOptions::new()
             .read(true)
@@ -291,7 +287,7 @@ impl<K> Store<K>
         log_state.manifest.read_only.push(log_state.manifest.active);
         log_state.manifest.active = file_id;
         let buf = rmp_serde::to_vec(&log_state.manifest)?;
-        let manifest_path = self.state.root.join(manifest_file());
+        let manifest_path = root.join(manifest_file());
         let mut manifest_file = tokio::fs::OpenOptions::new()
             .truncate(true)
             .write(true)
@@ -338,7 +334,9 @@ impl<K> Store<K>
 
     async fn compact(state: Arc<StoreState<K>>) -> Result<()> {
         let old_manifest = {
-            state.log_state.lock().expect("log state lock").manifest.clone()
+            let mut log_state = state.log_state.lock().await;
+            Self::create_new_active_log_file(state.root.clone(), &mut log_state).await?;
+            log_state.manifest.clone()
         };
 
         if old_manifest.read_only.is_empty() {
@@ -418,7 +416,7 @@ impl<K> Store<K>
 
         // add new compacted read-only logs
         {
-            let mut log_state = state.log_state.lock().expect("log state lock");
+            let mut log_state = state.log_state.lock().await;
             log_state.manifest.read_only.extend(new_logs.iter());
         }
 
@@ -441,7 +439,7 @@ impl<K> Store<K>
         // remove old compacted read-only logs from manifest
         let old_read_only = old_manifest.read_only.iter().collect::<HashSet<_>>();
         let new_manifest = {
-            let mut log_state = state.log_state.lock().expect("log state lock");
+            let mut log_state = state.log_state.lock().await;
             let updated_read_only = log_state.manifest.read_only
                 .iter()
                 .filter(|read_only| !old_read_only.contains(read_only))
@@ -516,7 +514,7 @@ impl<K> Store<K>
 
     async fn new_log(state: &Arc<StoreState<K>>) -> Result<Log> {
         let new_log_file_id = {
-            state.log_state.lock().expect("log state lock").next_file_id()
+            state.log_state.lock().await.next_file_id()
         };
 
         let new_log_file_name = state.root.join(log_file_name(new_log_file_id));
