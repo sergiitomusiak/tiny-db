@@ -4,7 +4,10 @@ use tiny_db::{Options, Store};
 async fn main() {
     let store = Store::open("./db/", Options::default()).await.unwrap();
     for i in 0..1_000_000 {
-        store.insert(i % 1000, format!("value_{i}")).await.unwrap();
+        store.insert(i % 100_000, format!("value_{i}")).await.unwrap();
+    }
+    for i in 0..50_000 {
+        store.remove(i % 100_000).await.unwrap();
     }
     let mut found = 0;
     let mut total_len: usize = 0;

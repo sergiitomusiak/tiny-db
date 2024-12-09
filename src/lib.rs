@@ -44,6 +44,31 @@ impl Default for Options {
     }
 }
 
+struct EntryMetadata(u64);
+
+impl EntryMetadata {
+    const DEFAULT_FLAGS: u64 = 0;
+    const DELETED_FLAG: u64 = 1 << 56;
+    const VERSION_MASK: u64 = !(0xff << 56);
+
+    fn new(version: u64, deleted: bool) -> Self {
+        let deleted = if deleted { Self::DELETED_FLAG } else { Self::DEFAULT_FLAGS };
+        EntryMetadata(version | deleted)
+    }
+
+    fn from_raw(metadata: u64) -> Self {
+        Self(metadata)
+    }
+
+    fn is_deleted(&self) -> bool {
+        self.0 & Self::DELETED_FLAG != 0
+    }
+
+    fn version(&self) -> u64 {
+        self.0 & Self::VERSION_MASK
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IndexEntry {
     offset: u64,
@@ -91,7 +116,6 @@ impl<K> Store<K>
     pub async fn open(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         // create or read manifest
         let manifest = create_or_read_manifest(&path, &options).await?;
-        println!("MANIFEST = {manifest:?}");
         // read index from files
         let mut log_stats = LogStats::default();
         let mut max_file_id: u64 = 0;
@@ -145,7 +169,7 @@ impl<K> Store<K>
 
     pub async fn get<V: DeserializeOwned>(&self, key: &K) -> Result<Option<V>> {
         let index_entry = {
-            let index = self.state.index.read().expect("index read");            
+            let index = self.state.index.read().expect("index read");
             let Some(index_entry) = index.get(key).cloned() else {
                 return Ok(None);
             };
@@ -160,14 +184,31 @@ impl<K> Store<K>
 
     pub async fn insert<V: Serialize>(&self, key: K, value: V) -> Result<()> {
         let mut buf = Vec::new();
-        // write key_len, key
         let (val_offset, val_len) = write_key_value(&mut buf, &key, &value)?;
+        self.insert_buf(key, &mut buf, val_len, val_offset, false).await
+    }
+
+    pub async fn remove(&self, key: K) -> Result<()> {
+        let mut buf = Vec::new();
+        let (val_offset, val_len) = write_key_raw_value(&mut buf, &key, &[])?;
+        self.insert_buf(key, &mut buf, val_len, val_offset, true).await
+    }
+
+    async fn insert_buf(&self, key:  K, buf: &mut [u8], val_len: usize, val_offset: usize, deleting: bool) -> Result<()> {
+        if deleting {
+            {
+                let index = self.state.index.read().expect("index read");
+                if !index.contains_key(&key) {
+                    return Ok(());
+                }
+            }
+        }
 
         // write to log with latest version
         let compaction_required = {
             let mut log_state = self.state.log_state.lock().expect("active log lock");
             let version = log_state.next_version();
-            write_u64(&mut buf, version);
+            write_u64(buf, EntryMetadata::new(version, deleting).0);
             let old_offset = log_state.active_log.append(&buf).await?;
 
             // update index
@@ -177,14 +218,22 @@ impl<K> Store<K>
                 file_id: log_state.active_log.id,
                 version,
             };
-            let mut index = self.state.index.write().expect("index write");
-            let new_entry = index.insert(key, index_entry).is_none();
-            log_state.entries_num += 1;
-
-            // increase live entries counter, if new entry was inserted
-            if new_entry {
-                log_state.live_entries_num += 1;
+            {
+                let mut index = self.state.index.write().expect("index write");
+                if deleting {
+                    let deleted = index.remove(&key).is_some();
+                    if deleted {
+                        log_state.live_entries_num -= 1;
+                    }
+                } else {
+                    let added = index.insert(key, index_entry).is_none();
+                    if added {
+                        log_state.live_entries_num += 1;
+                    }
+                }
             }
+
+            log_state.entries_num += 1;
 
             // check if new log must be created
             if log_state.active_log.len >= self.state.options.log_file_size {
@@ -204,7 +253,17 @@ impl<K> Store<K>
     }
 
     pub async fn force_compaction(&self) -> Result<()> {
-        Self::compact(self.state.clone()).await
+        {
+            let mut log_state = self.state.log_state.lock().unwrap();
+            self.create_new_active_log_file(&mut log_state).await?;
+        }
+        Self::compact(self.state.clone()).await?;
+        {
+            let log_state = self.state.log_state.lock().unwrap();
+            let live_fraction = log_state.live_entries_num as f64 / log_state.entries_num as f64;
+            println!("live fraction = {live_fraction}, live = {}, log_state.total = {}", log_state.live_entries_num, log_state.entries_num);
+        }
+        Ok(())
     }
 
     async fn read_from_log(log_file_name: impl AsRef<Path>, index_entry: &IndexEntry, buf: &mut Vec<u8>) -> Result<()> {
@@ -278,7 +337,7 @@ impl<K> Store<K>
     }
 
     async fn compact(state: Arc<StoreState<K>>) -> Result<()> {
-        let old_manifest = {  
+        let old_manifest = {
             state.log_state.lock().expect("log state lock").manifest.clone()
         };
 
@@ -310,7 +369,7 @@ impl<K> Store<K>
                 entries_discarded += 1;
                 log_entries_batch_size += log_entry.size();
                 log_entries_batch.push(log_entry);
-                if log_entries_batch.len() >= state.options.compaction_chunk_len 
+                if log_entries_batch.len() >= state.options.compaction_chunk_len
                     || (new_log.len + log_entries_batch_size) >= state.options.log_file_size
                 {
                     Self::write_live_log_entries(
@@ -328,7 +387,7 @@ impl<K> Store<K>
 
                 // check if new log file has to be created
                 if new_log.len >= state.options.log_file_size {
-                    new_log.file.flush().await?; 
+                    new_log.file.flush().await?;
                     new_logs.insert(new_log.id);
                     new_log = Self::new_log(&state).await?;
                 }
@@ -349,10 +408,10 @@ impl<K> Store<K>
 
         // flush new log file
         if new_log.len > 0 {
-            new_log.file.flush().await?; 
+            new_log.file.flush().await?;
             new_logs.insert(new_log.id);
         } else {
-            // No entries were written to the last log file 
+            // No entries were written to the last log file
             let empty_log_file_path = state.root.join(log_file_name(new_log.id));
             tokio::fs::remove_file(empty_log_file_path).await?;
         }
@@ -407,8 +466,8 @@ impl<K> Store<K>
     }
 
     async fn write_live_log_entries(
-        state: &Arc<StoreState<K>>, 
-        new_log: &mut Log, 
+        state: &Arc<StoreState<K>>,
+        new_log: &mut Log,
         log_entries_batch: Vec<LogEntry<K>>,
         index_updates: &mut HashMap<K, IndexEntry>,
         values_buf: &[u8],
@@ -422,9 +481,11 @@ impl<K> Store<K>
             for i in 0..log_entries_batch.len() {
                 log_entries_live_status[i] = {
                     let log_entry = &log_entries_batch[i];
+
+                    (!log_entry.metadata.is_deleted()) &&
                     index
                         .get(&log_entry.key)
-                        .map(|index_entry| index_entry.version == log_entry.version)
+                        .map(|index_entry| index_entry.version == log_entry.metadata.version())
                         .unwrap_or(false)
                 };
             }
@@ -437,13 +498,13 @@ impl<K> Store<K>
             if log_entries_live_status[i] {
                 // write key value into buffer
                 let (val_offset, _) = write_key_raw_value(buf, &log_entry.key, &values_buf[buf_val_start..(buf_val_start+val_len)])?;
-                write_u64(buf, log_entry.version);
+                write_u64(buf, log_entry.metadata.0);
                 let old_offset = new_log.append(&buf).await?;
                 let index_entry = IndexEntry {
                     offset: old_offset + val_offset as u64,
                     len: val_len as u64,
                     file_id: new_log.id,
-                    version: log_entry.version,
+                    version: log_entry.metadata.version(),
                 };
                 index_updates.insert(log_entry.key, index_entry);
             }
@@ -451,7 +512,7 @@ impl<K> Store<K>
         }
 
         Ok(())
-    }    
+    }
 
     async fn new_log(state: &Arc<StoreState<K>>) -> Result<Log> {
         let new_log_file_id = {
@@ -505,29 +566,33 @@ async fn create_or_read_manifest(path: impl AsRef<Path>, options: &Options) -> R
         let manifest = tokio::fs::read(manifest_path).await?;
         rmp_serde::from_slice(&manifest)?
     };
-    
+
     Ok(manifest)
 }
 
 // Index entry format
-// version (u64), key_len, key, value_len, value
-async fn read_log_into_index<K>(file_id: u64, file: &mut tokio::fs::File, index: &mut HashMap<K, IndexEntry>) -> Result<LogStats> 
+// metadata (u64), key_len, key, value_len, value
+async fn read_log_into_index<K>(file_id: u64, file: &mut tokio::fs::File, index: &mut HashMap<K, IndexEntry>) -> Result<LogStats>
     where K: DeserializeOwned + Eq + PartialEq + Hash,
 {
     let mut log_reader = LogReader::new(file);
     while let Some(log_entry) = log_reader.next().await? {
-        // insert key into index, if it is missing or has newer version
+        // remove or insert entry into index, if it is missing or has newer version
         let is_newer_version = index.get(&log_entry.key)
-            .map(|stored_index_entry| log_entry.version > stored_index_entry.version)
+            .map(|stored_index_entry| log_entry.metadata.version() > stored_index_entry.version)
             .unwrap_or(true);
         if is_newer_version {
-            let LogEntry { key, val_offset, val_len, version, ..} = log_entry;
-            index.insert(key, IndexEntry {
-                offset: val_offset,
-                len: val_len,
-                version,
-                file_id,
-            });
+            let LogEntry { key, val_offset, val_len, metadata, ..} = log_entry;
+            if metadata.is_deleted() {
+                index.remove(&key);
+            } else {
+                index.insert(key, IndexEntry {
+                    offset: val_offset,
+                    len: val_len,
+                    version: metadata.version(),
+                    file_id,
+                });
+            }
         }
     }
     Ok(log_reader.log_stats())

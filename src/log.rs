@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{EntryMetadata, Result};
 use crate::error::TinyDbError;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use std::io::ErrorKind;
 
 const LEN_FIELD_SIZE: usize = std::mem::size_of::<u64>();
-const VERSION_FIELD_SIZE: usize = std::mem::size_of::<u64>();
+const METADATA_FIELD_SIZE: usize = std::mem::size_of::<u64>();
 
 #[derive(Default, Debug)]
 pub struct LogStats {
@@ -45,7 +45,7 @@ pub(crate) async fn read(file: &mut File, offset: u64, len: u64, buf: &mut Vec<u
     Ok(())
 }
 
-pub(crate) fn write_key_value<K, V>(buf: &mut Vec<u8>, key: &K, value: &V) -> Result<(usize, usize)> 
+pub(crate) fn write_key_value<K, V>(buf: &mut Vec<u8>, key: &K, value: &V) -> Result<(usize, usize)>
     where
         K: Serialize,
         V: Serialize,
@@ -64,7 +64,7 @@ pub(crate) fn write_key_value<K, V>(buf: &mut Vec<u8>, key: &K, value: &V) -> Re
         Ok((val_start + LEN_FIELD_SIZE, val_len))
 }
 
-pub(crate) fn write_key_raw_value<K>(buf: &mut Vec<u8>, key: &K, value: &[u8]) -> Result<(usize, usize)> 
+pub(crate) fn write_key_raw_value<K>(buf: &mut Vec<u8>, key: &K, value: &[u8]) -> Result<(usize, usize)>
     where
         K: Serialize,
 {
@@ -95,13 +95,13 @@ pub(crate) struct LogEntry<K> {
     pub(crate) key_len: u64,
     pub(crate) val_offset: u64,
     pub(crate) val_len: u64,
-    pub(crate) version: u64,
+    pub(crate) metadata: EntryMetadata,
 }
 
 impl<K> LogEntry<K> {
     pub(crate) fn size(&self) -> u64 {
         // lengths of version key_len and val_len fields
-        (VERSION_FIELD_SIZE + 2*LEN_FIELD_SIZE) as u64 +
+        (METADATA_FIELD_SIZE + 2*LEN_FIELD_SIZE) as u64 +
         // lengths of key and value
         self.key_len + self.val_len
     }
@@ -119,20 +119,20 @@ impl<'a> LogReader<'a> {
         }
     }
 
-    pub(crate) async fn next<K>(&mut self) -> Result<Option<LogEntry<K>>> 
+    pub(crate) async fn next<K>(&mut self) -> Result<Option<LogEntry<K>>>
         where K: DeserializeOwned,
     {
         self.next_with_value_buffer(None).await
     }
 
-    pub(crate) async fn next_with_value_buffer<K>(&mut self, value_buf: Option<&mut Vec<u8>>) -> Result<Option<LogEntry<K>>> 
+    pub(crate) async fn next_with_value_buffer<K>(&mut self, value_buf: Option<&mut Vec<u8>>) -> Result<Option<LogEntry<K>>>
         where K: DeserializeOwned,
     {
-        let Some(version) = read_version(&mut self.buf_reader).await? else {
+        let Some(metadata) = read_metadata(&mut self.buf_reader).await? else {
             return Ok(None);
         };
 
-        self.log_stats.max_version = std::cmp::max(self.log_stats.max_version, version);
+        self.log_stats.max_version = std::cmp::max(self.log_stats.max_version, metadata.version());
         self.log_stats.entries_num += 1;
 
         // read key
@@ -151,7 +151,7 @@ impl<'a> LogReader<'a> {
             key_len,
             val_offset: self.val_offset,
             val_len: self.val_len,
-            version,
+            metadata,
         };
 
         let buf = if let Some(value_buf) = value_buf {
@@ -161,7 +161,7 @@ impl<'a> LogReader<'a> {
             &mut value_buf[val_start..(val_start+(val_len as usize))]
         } else {
             self.buf.resize(val_len as usize, 0);
-            &mut self.buf 
+            &mut self.buf
         };
 
         self.val_offset += val_len as u64;
@@ -175,10 +175,10 @@ impl<'a> LogReader<'a> {
     }
 }
 
-async fn read_version(buf_reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> Result<Option<u64>> {
-    let mut buf = [0u8; VERSION_FIELD_SIZE];
+async fn read_metadata(buf_reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> Result<Option<EntryMetadata>> {
+    let mut buf = [0u8; METADATA_FIELD_SIZE];
     let read_result = buf_reader.read_exact(&mut buf).await;
-    let version = match read_result {
+    let raw_metadata = match read_result {
         Ok(read_bytes) => {
             if read_bytes != buf.len() {
                 return Err(TinyDbError::from(std::io::Error::new(ErrorKind::UnexpectedEof, "log is corrupted")));
@@ -192,7 +192,7 @@ async fn read_version(buf_reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -
             return Err(TinyDbError::from(e));
         }
     };
-    Ok(Some(version))
+    Ok(Some(EntryMetadata::from_raw(raw_metadata)))
 }
 
 fn write_u64(buf: &mut [u8], value: u64) {
