@@ -420,6 +420,7 @@ impl<K> Store<K>
             log_state.manifest.read_only.extend(new_logs.iter());
         }
 
+        entries_discarded -= index_updates.len();
         // update index in chunks
         let chunks = map_into_chunks(index_updates, state.options.compaction_chunk_len);
         for chunk in chunks {
@@ -428,7 +429,6 @@ impl<K> Store<K>
                 for (key, new_index_entry) in chunk {
                     index.entry(key).and_modify(|stored_index_entry| {
                         if stored_index_entry.version == new_index_entry.version {
-                            entries_discarded -= 1;
                             *stored_index_entry = new_index_entry;
                         }
                     });
